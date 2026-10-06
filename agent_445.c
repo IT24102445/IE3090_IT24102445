@@ -69,7 +69,9 @@ int read_line(int socket_fd, char *buffer, size_t max_len) {
         ssize_t res = recv(socket_fd, &c, 1, 0);
         if (res <= 0) return res;
         if (c == '\n') break;
-        buffer[count++] = c;
+        if (c != '\r') {
+            buffer[count++] = c;
+        }
     }
     buffer[count] = '\0';
     return count;
@@ -116,6 +118,7 @@ void *handle_client(void *arg) {
             continue;
         }
 
+        // Authenticated Commands
         if (strncmp(buffer, "SYSINFO", 7) == 0) {
             dprintf(client_fd, "OK SYSINFO 0.15 512MB 3600 %s\n", SID_TAG);
         } else if (strncmp(buffer, "LISTPROC", 8) == 0) {
@@ -162,6 +165,9 @@ void *handle_client(void *arg) {
                     dprintf(client_fd, "ERR 006 CANNOT_WRITE_FILE %s\n", SID_TAG);
                     continue;
                 }
+
+                // Send ready signal to controller so it starts transmitting raw bytes
+                dprintf(client_fd, "OK READY_TO_RECEIVE %s\n", SID_TAG);
 
                 long remaining = filesize;
                 char fbuf[4096];
