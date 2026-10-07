@@ -16,6 +16,7 @@
 #define STORAGE_DIR "./agentfiles/IT24102445"
 
 #define BUFFER_SIZE 4096
+#define LOG_BUF_SIZE (BUFFER_SIZE + 512)
 
 pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -25,8 +26,10 @@ void log_event(const char *message) {
     if (f) {
         time_t now = time(NULL);
         char *t_str = ctime(&now);
-        t_str[strlen(t_str) - 1] = '\0';
-        fprintf(f, "[%s] %s\n", t_str, message);
+        if (t_str) {
+            t_str[strlen(t_str) - 1] = '\0';
+            fprintf(f, "[%s] %s\n", t_str, message);
+        }
         fclose(f);
     }
     pthread_mutex_unlock(&log_mutex);
@@ -86,7 +89,7 @@ void *handle_client(void *arg) {
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client_addr.sin_addr), ip_str, INET_ADDRSTRLEN);
 
-    char log_buf[256];
+    char log_buf[LOG_BUF_SIZE];
     snprintf(log_buf, sizeof(log_buf), "New TCP connection from %s", ip_str);
     log_event(log_buf);
 
@@ -98,9 +101,17 @@ void *handle_client(void *arg) {
         int bytes_read = read_line(client_fd, buffer, sizeof(buffer));
         if (bytes_read <= 0) break;
 
+        size_t len = strlen(buffer);
+        while (len > 0 && (buffer[len - 1] == '\r' || buffer[len - 1] == '\n' || buffer[len - 1] == ' ')) {
+            buffer[--len] = '\0';
+        }
+
+        if (len == 0) continue;
+
         snprintf(log_buf, sizeof(log_buf), "Received command from %s: %s", ip_str, buffer);
         log_event(log_buf);
 
+        // 1. Authentication Check
         if (!authenticated) {
             char token[128];
             if (sscanf(buffer, "AUTH %127s", token) == 1) {
@@ -118,12 +129,115 @@ void *handle_client(void *arg) {
             continue;
         }
 
-        // Authenticated Commands
-        if (strncmp(buffer, "SYSINFO", 7) == 0) {
+        // 2. Command Processing
+        if (strcmp(buffer, "SYSINFO") == 0 || strncmp(buffer, "SYSINFO ", 8) == 0) {
             dprintf(client_fd, "OK SYSINFO 0.15 512MB 3600 %s\n", SID_TAG);
-        } else if (strncmp(buffer, "LISTPROC", 8) == 0) {
+        } 
+        else if (strcmp(buffer, "LISTPROC") == 0 || strncmp(buffer, "LISTPROC ", 9) == 0) {
             dprintf(client_fd, "OK PROCS 1:init,102:systemd,445:agent %s\n", SID_TAG);
-        } else if (strncmp(buffer, "EXEC ", 5) == 0) {
+        } 
+        else if (strncmp(buffer, "PUT", 3) == 0) {
+            char filename[256];
+            long filesize = 0;
+            if (sscanf(buffer, "PUT %255s %ld", filename, &filesize) != 2) {
+                dprintf(client_fd, "ERR 000 USAGE_PUT_<filename>_<filesize> %s\n", SID_TAG);
+                continue;
+            }
+
+            if (filesize > 10 * 1024 * 1024) {
+                dprintf(client_fd, "ERR 004 FILE_TOO_LARGE %s\n", SID_TAG);
+                continue;
+            }
+
+            char filepath[512];
+            snprintf(filepath, sizeof(filepath), "%s/%s", STORAGE_DIR, filename);
+
+            FILE *fp = fopen(filepath, "wb");
+            if (!fp) {
+                dprintf(client_fd, "ERR 006 CANNOT_WRITE_FILE %s\n", SID_TAG);
+                continue;
+            }
+
+            dprintf(client_fd, "OK READY_TO_RECEIVE %s\n", SID_TAG);
+
+            long remaining = filesize;
+            char fbuf[4096];
+
+            // Transfer Throughput Measurement (PUT)
+            struct timespec start, end;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+
+            while (remaining > 0) {
+                size_t to_read = (remaining < sizeof(fbuf)) ? remaining : sizeof(fbuf);
+                ssize_t read_bytes = recv(client_fd, fbuf, to_read, 0);
+                if (read_bytes <= 0) break;
+                fwrite(fbuf, 1, read_bytes, fp);
+                remaining -= read_bytes;
+            }
+            fclose(fp);
+
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            double elapsed_sec = (end.tv_sec - start.tv_sec) + 
+                                 (end.tv_nsec - start.tv_nsec) / 1e9;
+            if (elapsed_sec < 0.000001) elapsed_sec = 0.000001;
+            double speed_bytes_per_sec = (double)filesize / elapsed_sec;
+
+            printf("[TRANSFER PUT] Speed: %.2f B/s (%.2f KB/s)\n", 
+                   speed_bytes_per_sec, speed_bytes_per_sec / 1024.0);
+
+            dprintf(client_fd, "OK FILE_RECEIVED %s %s\n", filename, SID_TAG);
+            snprintf(log_buf, sizeof(log_buf), "File uploaded: %s (Throughput: %.2f KB/s)", 
+                     filename, speed_bytes_per_sec / 1024.0);
+            log_event(log_buf);
+        } 
+        else if (strncmp(buffer, "GET", 3) == 0) {
+            char filename[256];
+            if (sscanf(buffer, "GET %255s", filename) != 1) {
+                dprintf(client_fd, "ERR 000 USAGE_GET_<filename> %s\n", SID_TAG);
+                continue;
+            }
+
+            char filepath[512];
+            snprintf(filepath, sizeof(filepath), "%s/%s", STORAGE_DIR, filename);
+
+            FILE *fp = fopen(filepath, "rb");
+            if (!fp) {
+                dprintf(client_fd, "ERR 005 FILE_NOT_FOUND %s\n", SID_TAG);
+                continue;
+            }
+
+            fseek(fp, 0, SEEK_END);
+            long filesize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+
+            dprintf(client_fd, "OK FILE_SEND %s %ld %s\n", filename, filesize, SID_TAG);
+
+            char fbuf[4096];
+            size_t bytes;
+
+            // Transfer Throughput Measurement (GET)
+            struct timespec start, end;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+
+            while ((bytes = fread(fbuf, 1, sizeof(fbuf), fp)) > 0) {
+                send(client_fd, fbuf, bytes, 0);
+            }
+            fclose(fp);
+
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            double elapsed_sec = (end.tv_sec - start.tv_sec) + 
+                                 (end.tv_nsec - start.tv_nsec) / 1e9;
+            if (elapsed_sec < 0.000001) elapsed_sec = 0.000001;
+            double speed_bytes_per_sec = (double)filesize / elapsed_sec;
+
+            printf("[TRANSFER GET] Speed: %.2f B/s (%.2f KB/s)\n", 
+                   speed_bytes_per_sec, speed_bytes_per_sec / 1024.0);
+
+            snprintf(log_buf, sizeof(log_buf), "File downloaded: %s (Throughput: %.2f KB/s)", 
+                     filename, speed_bytes_per_sec / 1024.0);
+            log_event(log_buf);
+        } 
+        else if (strncmp(buffer, "EXEC ", 5) == 0) {
             char cmd[64];
             sscanf(buffer, "EXEC %63s", cmd);
             if (strcmp(cmd, "DATE") == 0 || strcmp(cmd, "UPTIME") == 0 || 
@@ -149,68 +263,8 @@ void *handle_client(void *arg) {
             } else {
                 dprintf(client_fd, "ERR 002 COMMAND_NOT_ALLOWED %s\n", SID_TAG);
             }
-        } else if (strncmp(buffer, "PUT ", 4) == 0) {
-            char filename[256];
-            long filesize = 0;
-            if (sscanf(buffer, "PUT %255s %ld", filename, &filesize) == 2) {
-                if (filesize > 10 * 1024 * 1024) {
-                    dprintf(client_fd, "ERR 004 FILE_TOO_LARGE %s\n", SID_TAG);
-                    continue;
-                }
-                char filepath[512];
-                snprintf(filepath, sizeof(filepath), "%s/%s", STORAGE_DIR, filename);
-
-                FILE *fp = fopen(filepath, "wb");
-                if (!fp) {
-                    dprintf(client_fd, "ERR 006 CANNOT_WRITE_FILE %s\n", SID_TAG);
-                    continue;
-                }
-
-                // Send ready signal to controller so it starts transmitting raw bytes
-                dprintf(client_fd, "OK READY_TO_RECEIVE %s\n", SID_TAG);
-
-                long remaining = filesize;
-                char fbuf[4096];
-                while (remaining > 0) {
-                    size_t to_read = (remaining < sizeof(fbuf)) ? remaining : sizeof(fbuf);
-                    ssize_t read_bytes = recv(client_fd, fbuf, to_read, 0);
-                    if (read_bytes <= 0) break;
-                    fwrite(fbuf, 1, read_bytes, fp);
-                    remaining -= read_bytes;
-                }
-                fclose(fp);
-                dprintf(client_fd, "OK FILE_RECEIVED %s %s\n", filename, SID_TAG);
-                snprintf(log_buf, sizeof(log_buf), "File uploaded successfully: %s", filename);
-                log_event(log_buf);
-            }
-        } else if (strncmp(buffer, "GET ", 4) == 0) {
-            char filename[256];
-            sscanf(buffer, "GET %255s", filename);
-
-            char filepath[512];
-            snprintf(filepath, sizeof(filepath), "%s/%s", STORAGE_DIR, filename);
-
-            FILE *fp = fopen(filepath, "rb");
-            if (!fp) {
-                dprintf(client_fd, "ERR 005 FILE_NOT_FOUND %s\n", SID_TAG);
-                continue;
-            }
-
-            fseek(fp, 0, SEEK_END);
-            long filesize = ftell(fp);
-            fseek(fp, 0, SEEK_SET);
-
-            dprintf(client_fd, "OK FILE_SEND %s %ld %s\n", filename, filesize, SID_TAG);
-
-            char fbuf[4096];
-            size_t bytes;
-            while ((bytes = fread(fbuf, 1, sizeof(fbuf), fp)) > 0) {
-                send(client_fd, fbuf, bytes, 0);
-            }
-            fclose(fp);
-            snprintf(log_buf, sizeof(log_buf), "File downloaded successfully: %s", filename);
-            log_event(log_buf);
-        } else if (strncmp(buffer, "MONITOR START ", 14) == 0) {
+        } 
+        else if (strncmp(buffer, "MONITOR START ", 14) == 0) {
             int uport = 0;
             sscanf(buffer, "MONITOR START %d", &uport);
             if (!monitor.active) {
@@ -219,16 +273,19 @@ void *handle_client(void *arg) {
                 pthread_create(&monitor.thread_id, NULL, udp_monitor_thread, &monitor);
             }
             dprintf(client_fd, "OK MONITOR_STARTED %s\n", SID_TAG);
-        } else if (strncmp(buffer, "MONITOR STOP", 12) == 0) {
+        } 
+        else if (strncmp(buffer, "MONITOR STOP", 12) == 0) {
             if (monitor.active) {
                 monitor.active = 0;
                 pthread_join(monitor.thread_id, NULL);
             }
             dprintf(client_fd, "OK MONITOR_STOPPED %s\n", SID_TAG);
-        } else if (strncmp(buffer, "QUIT", 4) == 0) {
+        } 
+        else if (strcmp(buffer, "QUIT") == 0) {
             dprintf(client_fd, "OK BYE %s\n", SID_TAG);
             break;
-        } else {
+        } 
+        else {
             dprintf(client_fd, "ERR 000 UNKNOWN_COMMAND %s\n", SID_TAG);
         }
     }
@@ -249,6 +306,11 @@ int main() {
     mkdir(STORAGE_DIR, 0777);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("Socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -257,8 +319,15 @@ int main() {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
 
-    bind(server_fd, (struct sockaddr *)&address, sizeof(address));
-    listen(server_fd, 10);
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Bind failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_fd, 10) < 0) {
+        perror("Listen failed");
+        exit(EXIT_FAILURE);
+    }
 
     printf("[Agent] Server started on port %d...\n", PORT);
     log_event("Agent service started.");
@@ -270,6 +339,10 @@ int main() {
 
         if (new_socket >= 0) {
             client_args_t *args = malloc(sizeof(client_args_t));
+            if (!args) {
+                close(new_socket);
+                continue;
+            }
             args->client_fd = new_socket;
             args->client_addr = client_addr;
 
